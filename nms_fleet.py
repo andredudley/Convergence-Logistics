@@ -755,13 +755,13 @@ class KorvaxInterface:
             print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║     ◈  FIRST CONVERGENCE DETECTED  ◈                         ║
+║     ◈  FIRST CONVERGENCE DETECTED  ◈                        ║
 ║                                                              ║
-║     Before fleet operations can commence, the system          ║
-║     requires your current unit balance.                       ║
+║     Before fleet operations can commence, the system         ║
+║     requires your current unit balance.                      ║
 ║                                                              ║
-║     Enter the units currently in your exosuit.                ║
-║     Accuracy is logical. Deception is... unwise.              ║
+║     Enter the units currently in your exosuit.               ║
+║     Accuracy is logical. Deception is... unwise.             ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
             """)
@@ -815,7 +815,7 @@ class KorvaxInterface:
         print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║     ◈  CONVERGENCE LOGISTICS COMPANY  ◈                      ║
+║     ◈  CONVERGENCE LOGISTICS COMPANY  ◈                     ║
 ║                                                              ║
 ║     Convergence-grade fleet asset management                 ║
 ║     for Traveler of the Atlas standing                       ║
@@ -1045,7 +1045,7 @@ class KorvaxInterface:
 {KorvaxTerminal.HEADER}
 ║                                                              ║
 ║     Convergence complete.                                    ║
-║     Final balance: {balance:>10,} units                        ║
+║     Final balance: {balance:>10,} units                      ║
 ║     All data preserved. All decisions logged.                ║
 ║     The Atlas sees your dedication to logistical purity.     ║
 ║                                                              ║
