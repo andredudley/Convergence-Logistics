@@ -22,8 +22,8 @@ class KorvaxTerminal:
     """Renders outputs with appropriate Korvax computational aesthetic."""
     
     HEADER = "╔══════════════════════════════════════════════════════════════╗"
-    FOOTER = "╚══════════════════════════════════════════════════════════════╝"
-    DIVIDER = "╠══════════════════════════════════════════════════════════════╣"
+    FOOTER = "╚═════════════════════════════════════════════════════════════╝"
+    DIVIDER = "╠═════════════════════════════════════════════════════════════╣"
     THIN = "──────────────────────────────────────────────────────────────"
     
     @staticmethod
@@ -93,7 +93,7 @@ class FleetDatabase:
                 expedition_type TEXT NOT NULL CHECK(expedition_type IN
                     ('Combat','Trade','Exploration','Industrial','Balanced')),
                 duration_hours REAL NOT NULL,
-                fuel_cost_units INTEGER NOT NULL,
+                fuel_used_tonnes INTEGER NOT NULL,
                 frigates_deployed INTEGER NOT NULL,
                 expedition_result TEXT CHECK(expedition_result IN
                     ('Success','Partial','Failure','Frigate Damaged')),
@@ -146,6 +146,7 @@ class FleetDatabase:
             CREATE TABLE IF NOT EXISTS player_state (
                 id INTEGER PRIMARY KEY CHECK(id = 1),  -- Only one row allowed
                 current_balance_units INTEGER NOT NULL DEFAULT 0,
+                current_fuel_tonnes INTEGER NOT NULL DEFAULT 0,
                 traveler_standing TEXT DEFAULT 'Traveler of the Atlas',
                 last_updated TEXT NOT NULL DEFAULT (datetime('now')),
                 initial_balance_set INTEGER NOT NULL DEFAULT 0
@@ -154,18 +155,60 @@ class FleetDatabase:
         
         # Ensure player_state has the singleton row
         self.cursor.execute("""
-            INSERT OR IGNORE INTO player_state (id, current_balance_units, traveler_standing)
-            VALUES (1, 0, 'Traveler of the Atlas')
+            INSERT OR IGNORE INTO player_state (id, current_balance_units, current_fuel_tonnes, traveler_standing)
+            VALUES (1, 0, 0, 'Traveler of the Atlas')
         """)
         
         self.conn.commit()
+        self._migrate_schema()
     
+    def _migrate_schema(self):
+        """Migrate legacy database schema to support fuel tracking."""
+        player_columns = [row['name'] for row in self.cursor.execute("PRAGMA table_info(player_state)").fetchall()]
+        if 'current_fuel_tonnes' not in player_columns:
+            self.cursor.execute(
+                "ALTER TABLE player_state ADD COLUMN current_fuel_tonnes INTEGER NOT NULL DEFAULT 0"
+            )
+        expedition_columns = [row['name'] for row in self.cursor.execute("PRAGMA table_info(expedition_log)").fetchall()]
+        if 'fuel_used_tonnes' not in expedition_columns:
+            self.cursor.execute(
+                "ALTER TABLE expedition_log ADD COLUMN fuel_used_tonnes INTEGER NOT NULL DEFAULT 0"
+            )
+            if 'fuel_cost_units' in expedition_columns:
+                self.cursor.execute(
+                    "UPDATE expedition_log SET fuel_used_tonnes = fuel_cost_units"
+                )
+        self.conn.commit()
+
     def get_current_balance(self):
         """Retrieve the player's current unit balance."""
         result = self.cursor.execute(
             "SELECT current_balance_units, initial_balance_set FROM player_state WHERE id = 1"
         ).fetchone()
         return result['current_balance_units'], bool(result['initial_balance_set'])
+
+    def get_current_fuel(self):
+        """Retrieve the current frigate fuel reserve in tonnes."""
+        result = self.cursor.execute(
+            "SELECT current_fuel_tonnes FROM player_state WHERE id = 1"
+        ).fetchone()
+        return result['current_fuel_tonnes']
+
+    def update_fuel(self, delta):
+        """Adjust the frigate fuel reserve and return the new total."""
+        current = self.get_current_fuel()
+        new_fuel = current + delta
+        if new_fuel < 0:
+            KorvaxTerminal.error(
+                f"Insufficient fuel. Available: {current:,}t | Required: {abs(delta):,}t"
+            )
+            return None
+        self.cursor.execute(
+            "UPDATE player_state SET current_fuel_tonnes = ?, last_updated = datetime('now') WHERE id = 1",
+            (new_fuel,)
+        )
+        self.conn.commit()
+        return new_fuel
     
     def set_initial_balance(self, amount):
         """Set the starting balance. Only works once unless forced."""
@@ -279,6 +322,8 @@ class FleetLogistics:
             status = "⊗ DEPLETED"
         
         print(f"\n  ◈ CURRENT UNITS ON HAND: {balance:,}  [{status}]")
+        fuel = self.db.get_current_fuel()
+        print(f"  ◈ CURRENT FRIGATE FUEL: {fuel:,} tonnes")
         return balance
     
     # --- FRIGATE MANAGEMENT ---
@@ -364,17 +409,20 @@ class FleetLogistics:
     
     # --- EXPEDITION MANAGEMENT ---
     
-    def launch_expedition(self, expedition_type, duration_hours, fuel_cost, frigate_ids):
-        """Log an expedition and assign frigates. Fuel cost deducted from balance."""
+    def launch_expedition(self, expedition_type, duration_hours, fuel_tonnes, frigate_ids):
+        """Log an expedition and assign frigates. Fuel tonnes are consumed from reserves."""
         if not frigate_ids:
             KorvaxTerminal.error("Expedition requires at least one frigate. Logic demands it.")
             return None
         
-        # Check balance for fuel
-        balance, _ = self.db.get_current_balance()
-        if fuel_cost > balance:
+        # Check fuel reserves
+        current_fuel = self.db.get_current_fuel()
+        if fuel_tonnes <= 0:
+            KorvaxTerminal.error("Fuel consumption must be a positive integer.")
+            return None
+        if fuel_tonnes > current_fuel:
             KorvaxTerminal.error(
-                f"Insufficient units for fuel. Cost: {fuel_cost:,} | Balance: {balance:,}"
+                f"Insufficient fuel. Required: {fuel_tonnes:,}t | Available: {current_fuel:,}t"
             )
             return None
         
@@ -391,9 +439,9 @@ class FleetLogistics:
         
         expedition_id = self.db.execute("""
             INSERT INTO expedition_log 
-            (expedition_date, expedition_type, duration_hours, fuel_cost_units, frigates_deployed, expedition_result)
+            (expedition_date, expedition_type, duration_hours, fuel_used_tonnes, frigates_deployed, expedition_result)
             VALUES (date('now'), ?, ?, ?, ?, 'Success')
-        """, (expedition_type, duration_hours, fuel_cost, len(frigate_ids))).lastrowid
+        """, (expedition_type, duration_hours, fuel_tonnes, len(frigate_ids))).lastrowid
         
         # Assign frigates
         for fid in frigate_ids:
@@ -402,19 +450,11 @@ class FleetLogistics:
                 VALUES (?, ?)
             """, (expedition_id, fid))
         
-        # Deduct fuel from balance
-        new_balance = self.db.update_balance(-fuel_cost)
-        
-        # Log fuel as expense
-        self._record_transaction(
-            'Expense', fuel_cost, 'Expedition Fuel', 
-            f"Fuel for {expedition_type} expedition ({duration_hours}h), Expedition #{expedition_id}"
-        )
-        
+        new_fuel = self.db.update_fuel(-fuel_tonnes)
         return_date = datetime.now() + timedelta(hours=duration_hours)
         KorvaxTerminal.success(
             f"Expedition {expedition_id} launched. {len(frigate_ids)} frigates deployed. "
-            f"Fuel: {fuel_cost:,}u | Balance: {new_balance:,}u\n"
+            f"Fuel consumed: {fuel_tonnes:,} tonnes | Fuel remaining: {new_fuel:,} tonnes\n"
             f"  Return expected: {return_date.strftime('%Y-%m-%d %H:%M')}"
         )
         return expedition_id
@@ -506,11 +546,11 @@ class FleetLogistics:
             }.get(exp['expedition_result'], '?')
             
             gross = (exp['direct_units'] or 0) + (exp['item_value'] or 0)
-            net = gross - exp['fuel_cost_units']
+            net = gross
             total_net += net
             
             print(f"║  {result_icon} #{exp['id']:<4} {exp['expedition_date']} {exp['expedition_type']:<12} "
-                  f"{exp['duration_hours']}h | Fuel:{exp['fuel_cost_units']:>6,}u → Net:{net:>8,}u ║")
+                  f"{exp['duration_hours']}h | Fuel:{exp['fuel_used_tonnes']:>6,}t → Net:{net:>8,}u ║")
         
         KorvaxTerminal.info("Total Net Position", f"{total_net:,} units")
         KorvaxTerminal.end_block()
@@ -538,6 +578,28 @@ class FleetLogistics:
         if new_balance is not None:
             self._record_transaction('Expense', amount, source, description)
             KorvaxTerminal.info(f"{amount:,} units expended. New balance: {new_balance:,}")
+
+    def resupply_fuel(self, tonnes, unit_cost=0):
+        """Add frigate fuel reserves in tonnes, optionally paying units if cost is provided."""
+        if tonnes <= 0:
+            KorvaxTerminal.error("Refuel amount must be a positive integer.")
+            return None
+        if unit_cost < 0:
+            KorvaxTerminal.error("Unit cost cannot be negative.")
+            return None
+        if unit_cost and self.db.update_balance(-unit_cost) is None:
+            return None
+        if unit_cost:
+            self._record_transaction(
+                'Expense', unit_cost, 'Fuel Purchase',
+                f"Purchased {tonnes:,} tonnes of frigate fuel"
+            )
+        new_fuel = self.db.update_fuel(tonnes)
+        if new_fuel is not None:
+            KorvaxTerminal.success(
+                f"Refueled {tonnes:,} tonnes. Current fuel reserves: {new_fuel:,} tonnes."
+            )
+        return new_fuel
     
     def view_financial_summary(self):
         """Display unit ledger convergence - income, expenses, net position."""
@@ -568,7 +630,7 @@ class FleetLogistics:
         exp_stats = self.db.fetch_one("""
             SELECT 
                 COUNT(*) as total_expeditions,
-                COALESCE(SUM(fuel_cost_units), 0) as total_fuel_cost,
+                COALESCE(SUM(fuel_used_tonnes), 0) as total_fuel_burned,
                 COALESCE(SUM(CASE WHEN expedition_result = 'Success' THEN 1 ELSE 0 END), 0) as successful
             FROM expedition_log
         """)
@@ -589,7 +651,7 @@ class FleetLogistics:
         print(f"║{KorvaxTerminal.THIN}║")
         KorvaxTerminal.info("Fleet Size", f"{fleet_count} vessels worth {fleet_value:,}u")
         KorvaxTerminal.info("Expeditions", f"{exp_stats['total_expeditions']} total, {exp_stats['successful']} successful")
-        KorvaxTerminal.info("Total Fuel Burned", f"{exp_stats['total_fuel_cost']:,} units")
+        KorvaxTerminal.info("Total Fuel Burned", f"{exp_stats['total_fuel_burned']:,} tonnes")
         
         if balance < 100000:
             KorvaxTerminal.warn("Balance low. Consider trade route optimization or frigate deployment.")
@@ -707,7 +769,7 @@ class FleetLogistics:
         """Export expedition data for external analysis."""
         expeditions = self.db.fetch_all("""
             SELECT e.id, e.expedition_date, e.expedition_type, e.duration_hours,
-                   e.fuel_cost_units, e.expedition_result, e.frigates_deployed,
+                   e.fuel_used_tonnes, e.expedition_result, e.frigates_deployed,
                    COUNT(es.id) as spoil_count,
                    COALESCE(SUM(es.quantity * es.unit_value_estimate), 0) as total_value
             FROM expedition_log e
@@ -722,13 +784,13 @@ class FleetLogistics:
         
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['ID', 'Date', 'Type', 'Hours', 'Fuel Cost', 'Result', 
+            writer.writerow(['ID', 'Date', 'Type', 'Hours', 'Fuel Tonnes', 'Result', 
                             'Frigates', 'Spoil Types', 'Spoil Value', 'Net Profit'])
             for exp in expeditions:
-                net = (exp['total_value'] or 0) - exp['fuel_cost_units']
+                net = exp['total_value'] or 0
                 writer.writerow([
                     exp['id'], exp['expedition_date'], exp['expedition_type'],
-                    exp['duration_hours'], exp['fuel_cost_units'], exp['expedition_result'],
+                    exp['duration_hours'], exp['fuel_used_tonnes'], exp['expedition_result'],
                     exp['frigates_deployed'], exp['spoil_count'], exp['total_value'] or 0, net
                 ])
         
@@ -799,6 +861,8 @@ class KorvaxInterface:
                 self._menu_finances()
             elif choice == '7':
                 self._menu_inventory()
+            elif choice == 'F':
+                self._menu_refuel_fleet()
             elif choice == '8':
                 self._menu_record_transaction()
             elif choice == '9':
@@ -836,7 +900,8 @@ class KorvaxInterface:
 ║  [2] View Fleet Registry     [7] Inventory Manifest         ║
 ║  [3] Launch Expedition       [8] Record Transaction         ║
 ║  [4] Record Expedition Spoils[9] Export Data (CSV)          ║
-║  [5] Expedition History      [R] Reconcile Balance          ║
+║  [5] Expedition History      [F] Refuel Supply             ║
+║                              [R] Reconcile Balance          ║
 ║                              [0] Terminate Session          ║
 {KorvaxTerminal.FOOTER}
         """)
@@ -892,7 +957,7 @@ class KorvaxInterface:
         
         try:
             duration = float(KorvaxTerminal.prompt("Duration (hours)"))
-            fuel = int(KorvaxTerminal.prompt("Fuel cost (units)"))
+            fuel = int(KorvaxTerminal.prompt("Fuel required (tonnes)"))
         except ValueError:
             KorvaxTerminal.error("Numeric values required.")
             return
@@ -918,6 +983,16 @@ class KorvaxInterface:
         
         self.logistics.launch_expedition(exp_type, duration, fuel, frigate_ids)
     
+    def _menu_refuel_fleet(self):
+        KorvaxTerminal.title("FRIGATE FUEL RESUPPLY")
+        try:
+            tonnes = int(KorvaxTerminal.prompt("Fuel to add (tonnes)"))
+            cost = int(KorvaxTerminal.prompt("Optional unit cost for this fuel purchase (0 if none)"))
+        except ValueError:
+            KorvaxTerminal.error("Numeric values required.")
+            return
+        self.logistics.resupply_fuel(tonnes, cost)
+
     def _menu_record_spoils(self):
         KorvaxTerminal.title("EXPEDITION SPOILS CATALOGUE")
         
