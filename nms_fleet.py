@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CONVERGENCE LOGISTICS COMPANY
+CONVERGENCE LOGISTICS COMPANY v1.0.6
 ==============================
 Convergence-grade asset tracking for Traveler of the Atlas standing.
 Tracks units on hand, frigates, expeditions, and spoils with computational precision.
@@ -113,7 +113,6 @@ class FleetDatabase:
                 expedition_id INTEGER NOT NULL,
                 item_name TEXT NOT NULL,
                 quantity INTEGER NOT NULL DEFAULT 1,
-                unit_value_estimate INTEGER DEFAULT 0,
                 category TEXT CHECK(category IN
                     ('Units','Nanites','Trade Good','Module','Artifact','Material','Other')),
                 notes TEXT,
@@ -137,7 +136,6 @@ class FleetDatabase:
                 item_name TEXT NOT NULL,
                 category TEXT NOT NULL,
                 quantity INTEGER NOT NULL DEFAULT 1,
-                unit_value_estimate INTEGER DEFAULT 0,
                 storage_location TEXT DEFAULT 'Freighter',
                 last_updated TEXT NOT NULL DEFAULT (datetime('now')),
                 notes TEXT
@@ -178,7 +176,59 @@ class FleetDatabase:
                 self.cursor.execute(
                     "UPDATE expedition_log SET fuel_used_tonnes = fuel_cost_units"
                 )
+        
+        # Remove unit_value_estimate from expedition_spoils if it exists
+        spoils_columns = [row['name'] for row in self.cursor.execute("PRAGMA table_info(expedition_spoils)").fetchall()]
+        if 'unit_value_estimate' in spoils_columns:
+            self._recreate_table_without_column('expedition_spoils', 'unit_value_estimate')
+        
+        # Remove unit_value_estimate from inventory_manifest if it exists
+        inventory_columns = [row['name'] for row in self.cursor.execute("PRAGMA table_info(inventory_manifest)").fetchall()]
+        if 'unit_value_estimate' in inventory_columns:
+            self._recreate_table_without_column('inventory_manifest', 'unit_value_estimate')
+        
         self.conn.commit()
+    
+    def _recreate_table_without_column(self, table_name, column_to_remove):
+        """Recreate a table without a specific column, preserving data."""
+        # Get current schema
+        schema = self.cursor.execute(f"PRAGMA table_info({table_name})").fetchall()
+        columns = [col['name'] for col in schema if col['name'] != column_to_remove]
+        
+        # Create new table without the column
+        if table_name == 'expedition_spoils':
+            self.cursor.execute(f"""
+                CREATE TABLE {table_name}_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    expedition_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    category TEXT CHECK(category IN
+                        ('Units','Nanites','Trade Good','Module','Artifact','Material','Other')),
+                    notes TEXT,
+                    FOREIGN KEY(expedition_id) REFERENCES expedition_log(id) ON DELETE CASCADE
+                )
+            """)
+        elif table_name == 'inventory_manifest':
+            self.cursor.execute(f"""
+                CREATE TABLE {table_name}_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_name TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    storage_location TEXT DEFAULT 'Freighter',
+                    last_updated TEXT NOT NULL DEFAULT (datetime('now')),
+                    notes TEXT
+                )
+            """)
+        
+        # Copy data
+        columns_str = ', '.join(columns)
+        self.cursor.execute(f"INSERT INTO {table_name}_new ({columns_str}) SELECT {columns_str} FROM {table_name}")
+        
+        # Drop old table and rename new one
+        self.cursor.execute(f"DROP TABLE {table_name}")
+        self.cursor.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
 
     def get_current_balance(self):
         """Retrieve the player's current unit balance."""
@@ -462,7 +512,7 @@ class FleetLogistics:
     def record_expedition_spoils(self, expedition_id, spoils_list, result="Success"):
         """
         Record spoils from a returned expedition.
-        spoils_list: list of dicts with keys: item_name, quantity, unit_value_estimate, category
+        spoils_list: list of dicts with keys: item_name, quantity, category
         Unit-valued spoils are added directly to wallet balance.
         """
         # Update expedition result
@@ -472,35 +522,29 @@ class FleetLogistics:
         )
         
         total_units_earned = 0
-        total_item_value = 0
         
         for spoil in spoils_list:
             self.db.execute("""
                 INSERT INTO expedition_spoils 
-                (expedition_id, item_name, quantity, unit_value_estimate, category, notes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (expedition_id, item_name, quantity, category, notes)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 expedition_id,
                 spoil.get('item_name', 'Unknown Item'),
                 spoil.get('quantity', 1),
-                spoil.get('unit_value_estimate', 0),
                 spoil.get('category', 'Other'),
                 spoil.get('notes', '')
             ))
             
-            item_value = spoil.get('quantity', 1) * spoil.get('unit_value_estimate', 0)
-            
-            # If the spoil category is "Units", it goes directly to wallet
+            # If the spoil category is "Units", add quantity directly to wallet balance
             if spoil.get('category') == 'Units':
-                total_units_earned += item_value
+                total_units_earned += spoil.get('quantity', 1)
             else:
-                total_item_value += item_value
                 # Update inventory for physical items
                 self._update_inventory(
                     spoil.get('item_name', 'Unknown Item'),
                     spoil.get('category', 'Other'),
-                    spoil.get('quantity', 1),
-                    spoil.get('unit_value_estimate', 0)
+                    spoil.get('quantity', 1)
                 )
         
         # Add units directly to balance (not inventory)
@@ -514,7 +558,7 @@ class FleetLogistics:
         KorvaxTerminal.success(
             f"Expedition {expedition_id} concluded.\n"
             f"  Direct units earned: {total_units_earned:,}u\n"
-            f"  Item value (inventory): {total_item_value:,}u estimated\n"
+            f"  Items added to inventory.\n"
             f"  Result: {result}"
         )
     
@@ -523,8 +567,8 @@ class FleetLogistics:
         expeditions = self.db.fetch_all("""
             SELECT e.*, 
                    COUNT(es.id) as spoil_types,
-                   SUM(CASE WHEN es.category = 'Units' THEN es.quantity * es.unit_value_estimate ELSE 0 END) as direct_units,
-                   SUM(CASE WHEN es.category != 'Units' THEN es.quantity * es.unit_value_estimate ELSE 0 END) as item_value
+                   SUM(CASE WHEN es.category = 'Units' THEN es.quantity ELSE 0 END) as direct_units,
+                   0 as item_value
             FROM expedition_log e
             LEFT JOIN expedition_spoils es ON e.id = es.expedition_id
             GROUP BY e.id
@@ -636,7 +680,7 @@ class FleetLogistics:
         """)
         
         total_spoil_value = self.db.fetch_one("""
-            SELECT COALESCE(SUM(quantity * unit_value_estimate), 0) as total
+            SELECT COALESCE(SUM(quantity), 0) as total
             FROM expedition_spoils WHERE category = 'Units'
         """)['total']
         
@@ -660,7 +704,7 @@ class FleetLogistics:
     
     # --- INVENTORY MANAGEMENT ---
     
-    def _update_inventory(self, item_name, category, quantity, unit_value):
+    def _update_inventory(self, item_name, category, quantity):
         """Add or update inventory item."""
         existing = self.db.fetch_one(
             "SELECT id, quantity FROM inventory_manifest WHERE item_name = ? AND category = ?",
@@ -674,14 +718,14 @@ class FleetLogistics:
         else:
             self.db.execute(
                 """INSERT INTO inventory_manifest 
-                (item_name, category, quantity, unit_value_estimate, last_updated)
-                VALUES (?, ?, ?, ?, datetime('now'))""",
-                (item_name, category, quantity, unit_value)
+                (item_name, category, quantity, last_updated)
+                VALUES (?, ?, ?, datetime('now'))""",
+                (item_name, category, quantity)
             )
     
-    def add_inventory_item(self, item_name, category, quantity, unit_value, location="Freighter"):
+    def add_inventory_item(self, item_name, category, quantity, location="Freighter"):
         """Manually add item to inventory manifest."""
-        self._update_inventory(item_name, category, quantity, unit_value)
+        self._update_inventory(item_name, category, quantity)
         KorvaxTerminal.success(f"{quantity}x {item_name} added to {location} manifest.")
     
     def view_inventory(self, category_filter=None):
@@ -699,16 +743,16 @@ class FleetLogistics:
             KorvaxTerminal.warn("Inventory manifest is empty. Acquisition required.")
             return
         
-        total_value = sum(i['quantity'] * i['unit_value_estimate'] for i in items)
+        total_value = 0  # No longer calculated since unit_value_estimate removed
         
-        KorvaxTerminal.title(f"MANIFEST [{len(items)} item types, {total_value:,}u estimated]")
+        KorvaxTerminal.title(f"MANIFEST [{len(items)} item types]")
         
         current_category = ""
         for item in items:
             if item['category'] != current_category:
                 current_category = item['category']
                 print(f"║  ── {current_category} ──{' ' * (52 - len(current_category))}║")
-            print(f"║    {item['quantity']:>4}x {item['item_name']:<30} @ {item['unit_value_estimate']:>6,}u ║")
+            print(f"║    {item['quantity']:>4}x {item['item_name']:<30} ║")
         
         KorvaxTerminal.end_block()
     
@@ -771,7 +815,7 @@ class FleetLogistics:
             SELECT e.id, e.expedition_date, e.expedition_type, e.duration_hours,
                    e.fuel_used_tonnes, e.expedition_result, e.frigates_deployed,
                    COUNT(es.id) as spoil_count,
-                   COALESCE(SUM(es.quantity * es.unit_value_estimate), 0) as total_value
+                   COALESCE(SUM(CASE WHEN es.category = 'Units' THEN es.quantity ELSE 0 END), 0) as unit_spoils
             FROM expedition_log e
             LEFT JOIN expedition_spoils es ON e.id = es.expedition_id
             GROUP BY e.id
@@ -785,13 +829,13 @@ class FleetLogistics:
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['ID', 'Date', 'Type', 'Hours', 'Fuel Tonnes', 'Result', 
-                            'Frigates', 'Spoil Types', 'Spoil Value', 'Net Profit'])
+                            'Frigates', 'Spoil Types', 'Unit Spoils', 'Net Profit'])
             for exp in expeditions:
-                net = exp['total_value'] or 0
+                net = exp['unit_spoils'] or 0
                 writer.writerow([
                     exp['id'], exp['expedition_date'], exp['expedition_type'],
                     exp['duration_hours'], exp['fuel_used_tonnes'], exp['expedition_result'],
-                    exp['frigates_deployed'], exp['spoil_count'], exp['total_value'] or 0, net
+                    exp['frigates_deployed'], exp['spoil_count'], exp['unit_spoils'] or 0, net
                 ])
         
         KorvaxTerminal.success(f"Expedition log exported to {filename}")
@@ -1021,7 +1065,6 @@ class KorvaxInterface:
             
             try:
                 qty = int(KorvaxTerminal.prompt("Quantity") or "1")
-                val = int(KorvaxTerminal.prompt("Unit value estimate") or "0")
             except ValueError:
                 KorvaxTerminal.error("Numeric values required.")
                 continue
@@ -1032,7 +1075,6 @@ class KorvaxInterface:
             spoils.append({
                 'item_name': item,
                 'quantity': qty,
-                'unit_value_estimate': val,
                 'category': cat,
                 'notes': note
             })
